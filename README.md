@@ -1,4 +1,4 @@
-# PaperCuts ✂️
+# PaperCuts 
 
 **Cut through the literature.** PaperCuts is an evidence-mapping engine for
 academic research: give it a research question and it builds a deduplicated
