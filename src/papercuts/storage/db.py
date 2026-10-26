@@ -117,6 +117,40 @@ MIGRATIONS: list[str] = [
         INSERT INTO papers_fts(rowid, title, abstract) VALUES (new.rowid, new.title, coalesce(new.abstract, ''));
     END;
     """,
+    # v2 — Phase 2: embeddings, enrichment bookkeeping, merge log
+    """
+    ALTER TABLE papers ADD COLUMN abstract_source TEXT;
+    UPDATE papers SET abstract_source = source WHERE abstract IS NOT NULL AND abstract != '';
+
+    CREATE TABLE embeddings (
+        paper_id   TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+        model      TEXT NOT NULL,
+        dim        INTEGER NOT NULL,
+        text_hash  TEXT NOT NULL,
+        vector     BLOB NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (paper_id, model)
+    );
+
+    -- One row per (paper, enrichment source) so misses aren't re-queried every time.
+    CREATE TABLE enrichment_attempts (
+        paper_id     TEXT NOT NULL,
+        source       TEXT NOT NULL,
+        found        INTEGER NOT NULL,
+        attempted_at TEXT NOT NULL,
+        PRIMARY KEY (paper_id, source)
+    );
+
+    -- Every duplicate merge: same-DOI merges at ingest and title-based merges from `dedup`.
+    -- Later ingests of a dropped id are redirected to the kept id.
+    CREATE TABLE merges (
+        dropped_id TEXT PRIMARY KEY,
+        kept_id    TEXT NOT NULL,
+        reason     TEXT NOT NULL,
+        merged_at  TEXT NOT NULL
+    );
+    CREATE INDEX idx_merges_kept ON merges(kept_id);
+    """,
 ]
 
 
@@ -174,10 +208,19 @@ class Database:
         """
         c = self.conn
         now = _now()
-        existing = c.execute("SELECT id FROM papers WHERE id = ?", (paper.id,)).fetchone()
+        target_id = paper.id
+        redirect = c.execute("SELECT kept_id FROM merges WHERE dropped_id = ?", (paper.id,)).fetchone()
+        if redirect is not None:
+            target_id = redirect["kept_id"]
+        existing = c.execute("SELECT id FROM papers WHERE id = ?", (target_id,)).fetchone()
         if existing is None and paper.doi:
             existing = c.execute("SELECT id FROM papers WHERE doi = ?", (paper.doi,)).fetchone()
-        paper_id = existing["id"] if existing else paper.id
+            if existing is not None:
+                c.execute(
+                    "INSERT OR IGNORE INTO merges (dropped_id, kept_id, reason, merged_at) VALUES (?, ?, ?, ?)",
+                    (paper.id, existing["id"], "same DOI", now),
+                )
+        paper_id = existing["id"] if existing else target_id
         is_new = existing is None
 
         doi = paper.doi
@@ -192,16 +235,45 @@ class Database:
             language=paper.language, cited_by_count=paper.cited_by_count, is_oa=int(paper.is_oa),
             oa_url=paper.oa_url, topics=json.dumps([t.model_dump() for t in paper.topics]),
             raw=json.dumps(paper.raw, default=str), now=now,
+            abstract_source=paper.source if paper.abstract else None,
         )
+        if existing is not None and paper_id != paper.id:
+            # A different record of a paper we already hold (same DOI, or merged away earlier):
+            # only fill gaps, never overwrite the canonical record's title/type/authors.
+            c.execute(
+                """
+                UPDATE papers SET
+                    abstract_source = CASE WHEN (abstract IS NULL OR abstract = '') AND :abstract IS NOT NULL
+                                           THEN :abstract_source ELSE abstract_source END,
+                    abstract = CASE WHEN (abstract IS NULL OR abstract = '') THEN :abstract ELSE abstract END,
+                    year = coalesce(year, :year), venue = coalesce(venue, :venue),
+                    oa_url = coalesce(oa_url, :oa_url), is_oa = max(is_oa, :is_oa), updated_at = :now
+                WHERE id = :id
+                """,
+                values,
+            )
+        else:
+            self._full_upsert(values, paper)
+        self._add_references(paper_id, paper)
+        if paper.id != paper_id:
+            self._repoint_citations(paper.id, paper_id)
+        return paper_id, is_new
+
+    def _full_upsert(self, values: dict[str, Any], paper: Paper) -> None:
+        c = self.conn
+        paper_id = values["id"]
         c.execute(
             """
             INSERT INTO papers (id, source, doi, title, abstract, year, publication_date, venue, type, language,
-                                cited_by_count, is_oa, oa_url, topics, raw, first_seen_at, updated_at)
+                                cited_by_count, is_oa, oa_url, topics, raw, first_seen_at, updated_at,
+                                abstract_source)
             VALUES (:id, :source, :doi, :title, :abstract, :year, :publication_date, :venue, :type, :language,
-                    :cited_by_count, :is_oa, :oa_url, :topics, :raw, :now, :now)
+                    :cited_by_count, :is_oa, :oa_url, :topics, :raw, :now, :now, :abstract_source)
             ON CONFLICT(id) DO UPDATE SET
                 doi = coalesce(excluded.doi, papers.doi),
                 title = excluded.title,
+                abstract_source = CASE WHEN excluded.abstract IS NOT NULL
+                                       THEN excluded.abstract_source ELSE papers.abstract_source END,
                 abstract = coalesce(excluded.abstract, papers.abstract),
                 year = coalesce(excluded.year, papers.year),
                 publication_date = coalesce(excluded.publication_date, papers.publication_date),
@@ -230,16 +302,95 @@ class Database:
                 (paper_id, a.id, a.position, json.dumps(a.institutions)),
             )
 
-        if paper.references:
-            c.executemany(
-                "INSERT OR IGNORE INTO citations (citing_id, cited_id) VALUES (?, ?)",
-                [(paper_id, ref) for ref in paper.references if ref != paper_id],
+    def _add_references(self, paper_id: str, paper: Paper) -> None:
+        if not paper.references:
+            return
+        c = self.conn
+        c.executemany(
+            "INSERT OR IGNORE INTO citations (citing_id, cited_id) "
+            "VALUES (?, coalesce((SELECT kept_id FROM merges WHERE dropped_id = ?), ?))",
+            [(paper_id, ref, ref) for ref in paper.references if ref not in (paper_id, paper.id)],
+        )
+        c.execute("DELETE FROM citations WHERE citing_id = ? AND cited_id = ?", (paper_id, paper_id))
+
+    def _repoint_citations(self, old_id: str, new_id: str) -> None:
+        """Citations that pointed at old_id now point at new_id (no duplicates, no self-loops)."""
+        c = self.conn
+        c.execute("UPDATE OR IGNORE citations SET cited_id = ? WHERE cited_id = ?", (new_id, old_id))
+        c.execute("DELETE FROM citations WHERE cited_id = ?", (old_id,))
+        c.execute("DELETE FROM citations WHERE citing_id = cited_id")
+
+    @staticmethod
+    def _normalise_id(paper_id: str) -> str:
+        if not paper_id.startswith(("openalex:", "s2:", "arxiv:")) and paper_id.upper().startswith("W"):
+            return "openalex:" + paper_id.upper()
+        return paper_id
+
+    def resolve_id(self, paper_id: str) -> str | None:
+        """Accepts openalex:W…, W…, a DOI, or an id that was merged away; returns the stored id."""
+        pid = self._normalise_id(paper_id)
+        row = self.conn.execute(
+            "SELECT id FROM papers WHERE id = ? OR doi = lower(?) "
+            "UNION ALL SELECT kept_id FROM merges WHERE dropped_id = ? LIMIT 1",
+            (pid, pid, pid),
+        ).fetchone()
+        return row[0] if row else None
+
+    def merge_papers(self, keep_id: str, drop_id: str, reason: str) -> None:
+        """Fold drop_id into keep_id: fill gaps, move runs/citations/screening, log the merge."""
+        if keep_id == drop_id:
+            raise ValueError("cannot merge a paper into itself")
+        c = self.conn
+        keep = c.execute("SELECT * FROM papers WHERE id = ?", (keep_id,)).fetchone()
+        drop = c.execute("SELECT * FROM papers WHERE id = ?", (drop_id,)).fetchone()
+        if keep is None or drop is None:
+            raise KeyError(f"unknown paper: {keep_id if keep is None else drop_id}")
+        with c:
+            c.execute("UPDATE papers SET doi = NULL WHERE id = ?", (drop_id,))  # free the unique DOI slot
+            c.execute(
+                """
+                UPDATE papers SET
+                    doi = coalesce(doi, :doi),
+                    abstract_source = CASE WHEN (abstract IS NULL OR abstract = '') AND :abstract IS NOT NULL
+                                           THEN :abstract_source ELSE abstract_source END,
+                    abstract = CASE WHEN (abstract IS NULL OR abstract = '') THEN :abstract ELSE abstract END,
+                    year = coalesce(year, :year),
+                    venue = coalesce(venue, :venue),
+                    oa_url = coalesce(oa_url, :oa_url),
+                    is_oa = max(is_oa, :is_oa),
+                    cited_by_count = cited_by_count + :cited_by_count,
+                    updated_at = :now
+                WHERE id = :keep_id
+                """,
+                dict(doi=drop["doi"], abstract=drop["abstract"] or None, abstract_source=drop["abstract_source"],
+                     year=drop["year"], venue=drop["venue"], oa_url=drop["oa_url"], is_oa=drop["is_oa"],
+                     cited_by_count=drop["cited_by_count"], now=_now(), keep_id=keep_id),
             )
-        return paper_id, is_new
+            c.execute(
+                "INSERT OR IGNORE INTO run_papers (run_id, paper_id, rank) "
+                "SELECT run_id, ?, rank FROM run_papers WHERE paper_id = ?", (keep_id, drop_id),
+            )
+            c.execute(
+                "INSERT OR IGNORE INTO citations (citing_id, cited_id) "
+                "SELECT ?, cited_id FROM citations WHERE citing_id = ?", (keep_id, drop_id),
+            )
+            self._repoint_citations(drop_id, keep_id)
+            c.execute("UPDATE screening SET paper_id = ? WHERE paper_id = ?", (keep_id, drop_id))
+            c.execute(
+                "INSERT OR IGNORE INTO paper_authors (paper_id, author_id, position, institutions) "
+                "SELECT ?, author_id, position, institutions FROM paper_authors WHERE paper_id = ?",
+                (keep_id, drop_id),
+            )
+            c.execute("UPDATE merges SET kept_id = ? WHERE kept_id = ?", (keep_id, drop_id))
+            c.execute(
+                "INSERT OR REPLACE INTO merges (dropped_id, kept_id, reason, merged_at) VALUES (?, ?, ?, ?)",
+                (drop_id, keep_id, reason, _now()),
+            )
+            c.execute("DELETE FROM embeddings WHERE paper_id = ?", (keep_id,))  # text may have changed
+            c.execute("DELETE FROM papers WHERE id = ?", (drop_id,))  # cascades run_papers, authors, embeddings
 
     def get_paper(self, paper_id: str) -> dict[str, Any] | None:
-        if not paper_id.startswith(("openalex:", "s2:", "arxiv:")) and paper_id.upper().startswith("W"):
-            paper_id = "openalex:" + paper_id
+        paper_id = self.resolve_id(paper_id) or paper_id
         row = self.conn.execute(
             "SELECT * FROM papers WHERE id = ? OR doi = lower(?)", (paper_id, paper_id)
         ).fetchone()
@@ -312,6 +463,11 @@ class Database:
             "citation_edges_in_corpus": q(
                 "SELECT count(*) FROM citations c JOIN papers p ON p.id = c.cited_id"
             ),
+            "abstracts_backfilled": q(
+                "SELECT count(*) FROM papers WHERE abstract_source IS NOT NULL AND abstract_source != source"
+            ),
+            "embedded": q("SELECT count(DISTINCT paper_id) FROM embeddings"),
+            "duplicates_merged": q("SELECT count(*) FROM merges"),
             "runs": q("SELECT count(*) FROM runs"),
             "year_min": q("SELECT min(year) FROM papers"),
             "year_max": q("SELECT max(year) FROM papers"),
@@ -325,7 +481,13 @@ class Database:
             "WHERE decided_by = 'human' GROUP BY paper_id, stage) l ON s.id = l.mid"
         )
         return {
-            "records_identified": q("SELECT coalesce(sum(n_retrieved), 0) FROM runs WHERE status = 'done'"),
+            "identified_from_databases": q(
+                "SELECT coalesce(sum(n_retrieved), 0) FROM runs WHERE status = 'done' AND source NOT LIKE '%snowball%'"
+            ),
+            "identified_from_citation_search": q(
+                "SELECT coalesce(sum(n_retrieved), 0) FROM runs WHERE status = 'done' AND source LIKE '%snowball%'"
+            ),
+            "duplicates_removed": q("SELECT count(*) FROM merges"),
             "unique_records": q("SELECT count(DISTINCT paper_id) FROM run_papers"),
             "screened": q(f"SELECT count(*) FROM ({latest}) WHERE stage = 'title_abstract'"),
             "excluded_title_abstract": q(

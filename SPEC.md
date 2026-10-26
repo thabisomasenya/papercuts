@@ -73,7 +73,7 @@ screened / excluded (with reasons) / included = `screening`.
 
 ## Phases
 
-### Phase 1 — Corpus foundation  ✅ *this build*
+### Phase 1 — Corpus foundation  ✅
 - Async OpenAlex client: cursor paging, polite pool (`mailto`), retry with
   backoff on 429/5xx, `Retry-After` respected, concurrency limit
 - Abstract reconstruction from OpenAlex inverted index
@@ -85,12 +85,14 @@ screened / excluded (with reasons) / included = `screening`.
 
 **Demo:** `papercuts ingest "microplastics phytoplankton" --max 200` → `papercuts search "carbon fixation"`
 
-### Phase 2 — Semantic layer
-- Local embeddings for title + abstract; batch, cache, store as float32 BLOB
-- Dense search and hybrid search (RRF)
-- Cross-source dedup: exact DOI, then normalised-title + year fuzzy match
-- Semantic Scholar backfill for missing abstracts / references
-- **Eval:** 20 queries with judged relevant papers → report nDCG@10 for BM25 vs dense vs hybrid
+### Phase 2 — Semantic layer  ✅
+- Local embeddings for title + abstract (bge-small default); incremental via text hash; float32 BLOBs
+- Dense search, hybrid search (RRF, k=60), similar-paper lookup
+- Dedup: exact DOI at ingest, plus normalised-title fuzzy match (preprint ↔ published); merges logged and redirected
+- Semantic Scholar backfill for missing abstracts (misses remembered)
+- Backward citation snowballing (works cited by ≥N corpus papers), logged as its own run for PRISMA
+- **Eval:** pooled, method-blind judging (`judge`) → nDCG@10 / Recall@20 / MRR for BM25 vs dense vs hybrid (`eval`)
+- Later: forward snowballing (papers citing the corpus)
 
 ### Phase 3 — Screening and structured extraction
 - Inclusion/exclusion criteria defined per project

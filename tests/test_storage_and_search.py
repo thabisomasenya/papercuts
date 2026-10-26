@@ -11,9 +11,9 @@ from tests.conftest import FakeOpenAlex, make_work
 def test_schema_is_versioned_and_reopens(tmp_path):
     path = tmp_path / "x.db"
     with Database(path) as d:
-        assert d.schema_version == 1
+        assert d.schema_version == 2
     with Database(path) as d:  # re-opening must not re-run migrations
-        assert d.schema_version == 1
+        assert d.schema_version == 2
 
 
 def test_upsert_is_idempotent_and_updates(db):
@@ -67,7 +67,7 @@ async def test_ingest_end_to_end(db, no_sleep):
 
     st = db.stats()
     assert st["papers"] == 150
-    assert st["prisma"]["records_identified"] == 270  # every retrieved record, both runs
+    assert st["prisma"]["identified_from_databases"] == 270  # every retrieved record, both runs
     assert st["prisma"]["unique_records"] == 150
     assert st["citation_edges_in_corpus"] > 0  # references to other ingested papers resolved
 

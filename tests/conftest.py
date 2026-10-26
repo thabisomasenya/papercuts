@@ -62,6 +62,7 @@ class FakeOpenAlex:
         self.works = [make_work(i) for i in range(n_works)]
         self.fail_first = list(fail_first or [])  # [(status, headers), ...] returned before real responses
         self.requests: list[httpx.Request] = []
+        self.aliases: dict[str, int] = {}  # old id -> index of the work it was merged into
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -71,6 +72,8 @@ class FakeOpenAlex:
         params = request.url.params
         if request.url.path.startswith("/works/"):
             key = request.url.path.rsplit("/", 1)[-1]
+            if key in self.aliases:
+                return httpx.Response(200, json=self.works[self.aliases[key]])
             for w in self.works:
                 if w["id"].endswith(key):
                     return httpx.Response(200, json=w)

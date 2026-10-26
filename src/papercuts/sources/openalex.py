@@ -180,9 +180,10 @@ class OpenAlexClient:
         self._lock = asyncio.Lock()
         self._sleep = sleep
         self.requests_made = 0
-        ua = "PaperCuts/0.1" + (f" (mailto:{mailto})" if mailto else "")
+        ua = "PaperCuts/0.2" + (f" (mailto:{mailto})" if mailto else "")
         self._http = httpx.AsyncClient(
-            base_url=BASE_URL, timeout=timeout, transport=transport, headers={"User-Agent": ua}
+            base_url=BASE_URL, timeout=timeout, transport=transport, headers={"User-Agent": ua},
+            follow_redirects=True,  # merged works redirect to their canonical id
         )
 
     async def __aenter__(self) -> "OpenAlexClient":

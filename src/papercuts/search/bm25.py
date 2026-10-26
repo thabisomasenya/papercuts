@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Title matches count more than abstract matches. FTS5's bm25() returns *lower is
 # better* (negative numbers), so we negate it to get a conventional score.
@@ -29,6 +29,7 @@ class SearchHit:
     cited_by_count: int
     score: float
     snippet: str
+    ranks: dict[str, int] = field(default_factory=dict)  # method -> rank (hybrid explains itself)
 
 
 def build_fts_query(query: str, mode: str = "any") -> str:
